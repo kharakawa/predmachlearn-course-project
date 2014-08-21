@@ -1,0 +1,254 @@
+---
+title: "Classification on Weight Lifting Exercises Data"
+output: html_document
+---
+
+## Synopsis
+
+In this report, we will try to build a classifier and try to estimate its out-of-sample performance. The classifier is built on [Weight Lifting Exercises Data][], in which 6 participants have been performed dumbbell exercises in 5 different ways, i.e. correctly (A) and incorrectly (B, C, D, E). 
+
+The classifier is built using [Random Forest][] algorithm. The original dataset is split at the outset of the analysis, into the training set (80%) and validation set (20%). Only the training set is used in a repeated (5 times) 10-fold cross validation to train a model, estimating its out-of-sample error. Finally, the model performance is confirmed on the separate validation set. From the result of the validation set prediction, we estimate that the out-of-sample accuracy of the model is around 95%.
+
+[Weight Lifting Exercises Data]: http://groupware.les.inf.puc-rio.br/har "see the section 'Weight Lifting Exercises Dataset'"
+[Random Forest]: http://en.wikipedia.org/wiki/Random_forest
+
+## Details
+
+```{r, echo=FALSE, message=FALSE}
+library(caret)
+library(knitr)
+opts_chunk$set(cache=TRUE, message=FALSE)
+
+library(doMC)
+registerDoMC(cores = 2)
+start_time = Sys.time()
+```
+
+
+### Getting / Loading Data
+
+The data is downloaded from the course project page, and is loaded into the workspace with standard `csv.read()` function.
+
+
+```{r}
+training_csv_url = 'https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv'
+training_csv = basename(training_csv_url)
+
+if (!file.exists(training_csv)) {
+  download.file(training_csv_url, destfile=training_csv, method='curl')
+}
+```
+
+```{r data loading, cache=TRUE}
+training <- read.csv(training_csv, na.strings=c('""', 'NA', '#DIV/0!'))
+dim(training)
+```
+
+From the result of the `str()` function, we can see the following things:
+
+* outcome is in the `classe` column
+* some columns are not a part of sensor data (e.g. timestamps, participants' name, etc.) 
+* a lot of data point is missing (`NA`)
+
+```{r, eval=FALSE}
+str(training)  # output is omitted to save the space.
+```
+
+To address first two problems, only the sensor data is extracted from the training data, and they are converted into a numeric matrix.
+
+```{r data matrix, cache=TRUE}
+training_matrix_all <- data.matrix(
+  subset(training,
+         select=-c(X, 
+                   user_name,
+                   raw_timestamp_part_1,
+                   raw_timestamp_part_2,
+                   cvtd_timestamp,
+                   new_window,
+                   num_window,
+                   classe)))
+```
+
+### Splitting the Training Data
+
+To build a model, we will use cross validation method, which is built into the `caret::train()` function. The function takes a set of training data, and performs cross validation tests internally to select an optimal model.
+After getting a model, we will need to confirm its performance by a validation dataset, which should not be overlapped with the training dataset. 
+
+So before the further processing, we split the original dataset into two parts, training dataset (`training_matrix`) and validation dataset (`validation_matrix`). This is done by `caret::createDataPartition()` as shown below.
+
+We selected a commonly used number of 20%, to set apart the validation data.
+
+```{r}
+set.seed(18181)
+in_train <- createDataPartition(y=training$classe, p=0.8, list=F)
+training_matrix <- training_matrix_all[in_train,]
+validation_matrix <- training_matrix_all[-in_train, ]
+dim(training_matrix)
+dim(validation_matrix)
+```
+
+### Filtering Columns
+
+Although the dataset has a fairly large number of columns, they are not necessarily informative to predict the outcome. Having too many variables is also negative for the model training time. So we try to filter out valueless variables, by removing columns filled mostly with NAs, finding near zero variance variables, and highly correlated variables. Also, data normalization and imputation of missing values is done along the way. All the transformation is done by functionality of `caret` package. See [the document about pre-processing][caret preprocess] for the details.
+
+[caret preprocess]: http://caret.r-forge.r-project.org/preprocess.html
+
+#### Removing Columns Filled Mostly with NAs
+
+Columns in which almost all (90% or more) data is missing is removed.
+
+```{r almost all columns}
+table(apply(training_matrix, 2, function(x) sum(is.na(x))))
+na_cols = apply(training_matrix, 2, function(x) sum(is.na(x))) > (0.9 * nrow(training_matrix))
+training_matrix_rmnacol <- training_matrix[,!na_cols]
+dim(training_matrix_rmnacol)
+```
+
+#### Removing Near Zero Variance Variables
+
+Variables without much variance are removed here.
+
+```{r near zero variance, cache=TRUE}
+nzv <- nearZeroVar(training_matrix_rmnacol, saveMetrics = TRUE)
+training_matrix_filtered <- training_matrix_rmnacol[,!nzv$nzv]
+dim(training_matrix_filtered)
+```
+
+In this case, no such columns are found.
+
+#### Normalizing Variables and Imputing Missing Values 
+
+Then, imputation of remaining missing data and centering/scaling is done. In the training set, in this case, there is no missing data, but the future data may have NAs, so the process is needed.
+
+```{r impute and scale, cache=TRUE}
+sum(is.na(training_matrix_filtered))
+impute_model <- preProcess(training_matrix_filtered, method="medianImpute")
+tmp <- predict(impute_model, training_matrix_filtered)
+scale_model <- preProcess(tmp, method=c('center', 'scale'))
+training_matrix_transformed <- predict(scale_model, tmp)
+rm('tmp')
+sum(is.na(training_matrix_transformed))
+```
+
+#### Removing Highly Correlated Variables
+
+Columns with high correlation (90% or more) are removed.
+
+```{r correlated}
+cor_training <- cor(training_matrix_transformed)
+summary(cor_training[upper.tri(cor_training)])
+highly_correlated = findCorrelation(cor_training)
+training_matrix_nocor <- training_matrix_transformed[, -highly_correlated]
+dim(training_matrix_nocor)
+```
+
+### Dimensionality Reduction by PCA
+
+Even after removing variables with near zero variance and/or high correlation, there are `r ncol(training_matrix_nocor)` columns in the dataset. It is still a high number, so we try [PCA][] for further reduction. In this instance, 80% of the variance is retained.
+
+[PCA]: http://en.wikipedia.org/wiki/Principal_component_analysis
+
+```{r pca}
+pca_model <- preProcess(training_matrix_nocor, method="pca", thresh=0.8)
+training_matrix_pca <- predict(pca_model, training_matrix_nocor)
+dim(training_matrix_pca)
+```
+
+By using PCA, interpretation of the predictors in the model would become difficult, and it might somewhat lower the prediction performance of the resulting model, but I preferred the compact model here. As a result, the number of the columns are reduced drastically, from `r ncol(training_matrix_nocor)` to `r ncol(training_matrix_pca)`.
+
+### Training Model
+
+Then, finally, a model is trained with the principal components as its predictors. [Random Forest][] is chosen as an algorithm, and a repeated (5 times) 10-fold cross validation is used to estimate a out-of-sample error and to select an optimal parameter set.
+
+```{r random forest model, cache=TRUE}
+training_df <- cbind(data.frame(training_matrix_pca), classe=training[in_train, ]$classe)
+control <- trainControl(method="repeatedcv",
+                        number=10, repeats=5)
+rf_model <- train(classe ~ ., data=training_df,
+                  method='rf', trControl=control)
+rf_model
+rf_model$finalModel
+```
+
+As it can be seen from the result, the estimated accuracy is `r sprintf("%.2f%%", rf_model$results[1,2] * 100)` (i.e. estimated out-of-sample error is about `r sprintf("%.2f%%", (1 - rf_model$results[1,2]) * 100)`). Let us confirm it by using validation dataset, which is completely separated from the training set.
+
+To make a prediction on new data, it is necessary to transform them by using the same method in which the training set is done.
+
+```{r validation data}
+validation_matrix_rmnacol <- validation_matrix[,!na_cols]
+validation_matrix_transformed <-
+  predict(scale_model,
+          predict(impute_model,
+                  validation_matrix_rmnacol[, !nzv$nzv]))
+validation_matrix_pca <- predict(pca_model,
+                                 validation_matrix_transformed[, -highly_correlated])
+
+validation_predict <- predict(rf_model, validation_matrix_pca)
+validation_result <- confusionMatrix(validation_predict, training[-in_train,]$classe)
+validation_result
+```
+
+As shown in the result, accuracy of the classification on the validation set is `r sprintf("%.2f%%", validation_result$overall[1] * 100)`. This is roughly the same level as the result of the cross validation process (done in the `caret::train()` function).
+
+## Appendix
+
+### Appendix A. Normalized Confusion Matrix of the Final Model (on Validation Set)
+
+```{r}
+library(reshape2)
+library(scales)
+validation_result_norm <- apply(validation_result$table, 1,
+                                function(x) x / sum(x))
+confusion_df <- melt(validation_result_norm)
+confusion_df$Prediction <- with(confusion_df,
+                                factor(Prediction,
+                                       levels=rev(levels(Prediction))))
+colnames(confusion_df) <- c('Actual', 'Predicted', 'value')
+
+g <- ggplot(confusion_df, aes(x=Actual, y=Predicted)) + 
+  geom_tile(aes(fill=value)) + 
+  scale_fill_gradient2(limits=c(0,1), 
+                       high=muted("red"), mid="yellow", low="white", 
+                       midpoint=0.5, trans="sqrt") + 
+  geom_text(aes(label=round(value, 3))) +
+  xlab("Actual Class") +
+  ylab("Predicted Class") +
+  ggtitle("Normalized Confusion Matrix of the Final Model (against Validation Set)")
+print(g)
+```
+
+
+### Appendix B. Predicting Course Test Data (code is not evaluated)
+
+```{r eval=FALSE}
+testing_csv_url = 'https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv'
+testing_csv = basename(testing_csv_url)
+
+if (!file.exists(testing_csv)) {
+  download.file(testing_csv_url, destfile=testing_csv, method='curl')
+}
+
+testing <- read.csv(testing_csv, na.strings=c('""', 'NA', '#DIV/0!'))
+dim(testing)
+
+testing_matrix <- data.matrix(
+  subset(testing,
+         select=-c(X, 
+                   user_name,
+                   raw_timestamp_part_1,
+                   raw_timestamp_part_2,
+                   cvtd_timestamp,
+                   new_window,
+                   num_window,
+                   problem_id)))
+
+testing_matrix_rmnacol <- testing_matrix[, !na_cols]
+testing_matrix_transformed <-
+  predict(scale_model,
+          predict(impute_model,
+                  testing_matrix_rmnacol[, !nzv$nzv]))
+testing_matrix_pca <- predict(pca_model,
+                              testing_matrix_transformed[, -highly_correlated])
+
+testing_predict <- predict(rf_model, testing_matrix_pca)
+```
